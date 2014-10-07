@@ -20,14 +20,51 @@ from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
+from ryu.lib.packet import arp
+from ryu.lib.packet import ipv4
+from ryu.lib.packet import tcp
+from ryu.lib.packet import udp
+from ryu.lib.packet import icmp
+from ryu.lib.packet import arp
+from ryu.lib.packet import vlan
 
+
+## Infinite flows can be a bad thing, so we set some timeouts we'll use later
+OPENFLOW_IDLE_TIMEOUT = 30
+OPENFLOW_HARD_TIMEOUT = 60
+
+## We use our 'danceslib', which is based off of snortlib, a provided file
+import danceslib
 
 class SimpleSwitch13(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {'danceslib': danceslib.DANCESLib}
 
     def __init__(self, *args, **kwargs):
         super(SimpleSwitch13, self).__init__(*args, **kwargs)
+        
+        self.prio_host_mac = 0
+        self.prio_tcp_port = 0
+        
         self.mac_to_port = {}
+        
+        ## DANCES LIB
+        self.dancer = kwargs['danceslib']
+        socket_config = {
+            'unixsock': True, 
+        }
+        self.dancer.set_config(socket_config)
+        self.dancer.start_socket_server()
+    
+    @set_ev_cls(danceslib.EventAlert, MAIN_DISPATCHER)
+    def _dump_alert(self, ev):
+        msg = ev.msg
+        msg = msg.strip()
+
+        print "Alert! (",msg,")"
+        ## TODO: From here, we'll use the message to set up some self
+        ##          variables and add flows to packets
+
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -55,8 +92,23 @@ class SimpleSwitch13(app_manager.RyuApp):
                                              actions)]
 
         mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                match=match, instructions=inst)
+                                match=match, instructions=inst,
+                                idle_timeout=OPENFLOW_IDLE_TIMEOUT,
+                                hard_timeout=OPENFLOW_HARD_TIMEOUT)
         datapath.send_msg(mod)
+
+    def remove_flow(self, datapath, table_id, match, actions):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        inst = [parser.OFPInstructionActions(ofproto.OFPFC_DELETE)],
+
+        mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+                                match=match, instructions=inst)
+
+        datapath.send_msg(mod)
+        
+        return flow_mod
 
     def limit_flow(self, datapath, hw_mac=""):
         ofp = datapath.ofproto
@@ -86,37 +138,6 @@ class SimpleSwitch13(app_manager.RyuApp):
                 return port
         return None
 
-    ## @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
-    ## def port_desc_stats_reply_handler(self, ev):
-    ##     ports = []
-
-    ##     msg = ev.msg
-    ##     datapath = msg.datapath
-    ##     ofproto = datapath.ofproto
-    ##     parser = datapath.ofproto_parser
-    ##     ## So, when we ask for port descriptions, we want to add a flow
-    ##     ## for that port (so, all ports)
-    ##     for p in ev.msg.body:
-    ##         ports.append('port_no=%d hw_addr=%s name=%s config=0x%08x '
-    ##                      'state=0x%08x curr=0x%08x advertised=0x%08x '
-    ##                      'supported=0x%08x peer=0x%08x curr_speed=%d '
-    ##                      'max_speed=%d' %
-    ##                      (p.port_no, p.hw_addr,
-    ##                       p.name, p.config,
-    ##                       p.state, p.curr, p.advertised,
-    ##                       p.supported, p.peer, p.curr_speed,
-    ##                       p.max_speed))
-    ##         in_port = msg.match[p.name]
-    ##         self.logger.debug("Adding flow for: %s", in_port)
-
-    ##         actions = [parser.OFPActionSetQueue(123)]
-    ##         match = parser.OFPMatch(in_port=in_port)
-    ##         self.add_flow(datapath, 1, match, actions)
-    ##         self.logger.debug("Flow added")
-
-    ##     self.logger.debug('OFPPortDescStatsReply received: %s', ports)
-
-
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
@@ -130,6 +151,11 @@ class SimpleSwitch13(app_manager.RyuApp):
 
         dst = eth.dst
         src = eth.src
+
+        if pkt.get_protocol(ipv4.ipv4):
+            dsttcp = pkt.get_protocol(tcp.tcp)
+            if dsttcp is not None:
+                print ">>-> dsttcp: ", dsttcp.dst_port
 
         dpid = datapath.id
         self.mac_to_port.setdefault(dpid, {})
@@ -145,8 +171,10 @@ class SimpleSwitch13(app_manager.RyuApp):
         else:
             out_port = ofproto.OFPP_FLOOD
 
+        ## Here, we see if we have an outstanding request, add it in as a flow?
+
         ## Set up a QoS for traffic from host1
-        if src == "00:00:00:00:00:01":
+        if self.prio_host_mac and self.prio_tcp_port and (src == self.prio_host_mac) and (self.prio_tcp_port == tcp_src):
             actions = [parser.OFPActionSetQueue(123), parser.OFPActionOutput(out_port)]
         else:
             actions = [parser.OFPActionOutput(out_port)]
@@ -164,19 +192,4 @@ class SimpleSwitch13(app_manager.RyuApp):
                                   in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
         
-
-##     @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
-##     def port_desc_stats_reply_handler(self, ev):
-##         ports = []
-##         for p in ev.msg.body:
-##             ports.append('port_no=%d hw_addr=%s name=%s config=0x%08x '
-##                          'state=0x%08x curr=0x%08x advertised=0x%08x '
-##                          'supported=0x%08x peer=0x%08x curr_speed=%d '
-##                          'max_speed=%d' %
-##                          (p.port_no, p.hw_addr,
-##                           p.name, p.config,
-##                           p.state, p.curr, p.advertised,
-##                           p.supported, p.peer, p.curr_speed,
-##                           p.max_speed))
-##         self.logger.debug('OFPPortDescStatsReply received: %s', ports)
 
